@@ -23,14 +23,8 @@ conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
 
-# --- Миграция: добавляем поле weekly_posts, если его нет ---
 with db_lock:
-    cursor.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "weekly_posts" not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN weekly_posts INTEGER DEFAULT 0")
-        conn.commit()
-
+    # Создаём таблицы, если их нет (сразу с нужными полями)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER,
@@ -63,6 +57,14 @@ with db_lock:
             verified INTEGER DEFAULT 0
         )
     """)
+    
+    # Если таблица users уже существовала и не содержала поля weekly_posts, добавим его
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "weekly_posts" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN weekly_posts INTEGER DEFAULT 0")
+        conn.commit()
+    
     conn.commit()
 
 link_pattern = r"https://t.me/\S+"
@@ -147,7 +149,6 @@ def handle_message(message):
     now = int(time.time())
 
     with db_lock:
-        # Получаем текущее количество постов пользователя за эту неделю
         cursor.execute(
             "SELECT weekly_posts FROM users WHERE id=? AND chat_id=?",
             (user_id, chat_id)
@@ -264,7 +265,7 @@ def scheduler():
         week_num = now_dt.isocalendar()[1]
 
         # ---- Сброс счётчика weekly_posts в понедельник 00:00 МСК ----
-        if day == 0 and hour == 0 and now - last_week_reset > 3600:  # делаем раз в час, чтобы не повторять
+        if day == 0 and hour == 0 and now - last_week_reset > 3600:
             with db_lock:
                 cursor.execute("UPDATE users SET weekly_posts = 0")
                 conn.commit()
