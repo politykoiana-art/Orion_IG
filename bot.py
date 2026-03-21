@@ -24,7 +24,7 @@ cursor = conn.cursor()
 db_lock = threading.Lock()
 
 with db_lock:
-    # Создаём таблицы, если их нет (сразу с нужными полями)
+    # 1. Создаём таблицы (если их нет)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER,
@@ -57,15 +57,14 @@ with db_lock:
             verified INTEGER DEFAULT 0
         )
     """)
-    
-    # Если таблица users уже существовала и не содержала поля weekly_posts, добавим его
+    conn.commit()
+
+    # 2. Проверяем, есть ли поле weekly_posts (на случай, если таблица уже существовала без него)
     cursor.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in cursor.fetchall()]
     if "weekly_posts" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN weekly_posts INTEGER DEFAULT 0")
         conn.commit()
-    
-    conn.commit()
 
 link_pattern = r"https://t.me/\S+"
 MSK = datetime.timezone(datetime.timedelta(hours=3))
@@ -106,13 +105,6 @@ def keyboard(task_id):
     ))
     return markup
 
-def get_week_start():
-    """Возвращает timestamp начала текущей недели (понедельник 00:00 МСК)"""
-    now = msk_now()
-    start_of_week = now - datetime.timedelta(days=now.weekday())
-    start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(start_of_week.timestamp())
-
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     if not message.text:
@@ -145,7 +137,6 @@ def handle_message(message):
     activity = message.text.replace(link, "").strip() or "лайк"
 
     # ---- Недельный лимит: 4 поста с понедельника по пятницу ----
-    week_start = get_week_start()
     now = int(time.time())
 
     with db_lock:
@@ -157,7 +148,10 @@ def handle_message(message):
         current_posts = row[0] if row else 0
 
     if current_posts >= 4:
-        bot.send_message(chat_id, "❗ Лимит 4 задания в рабочую неделю")
+        bot.send_message(
+            chat_id,
+            f"❗ @{message.from_user.username}, лимит 4 задания в рабочую неделю исчерпан. Задание не создано."
+        )
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
@@ -174,7 +168,6 @@ def handle_message(message):
         )
         task_id = cursor.lastrowid
 
-        # Обновляем счётчик постов пользователя
         cursor.execute(
             "INSERT INTO users (id, chat_id, username, last_active, weekly_posts) "
             "VALUES (?, ?, ?, ?, 1) "
@@ -234,7 +227,6 @@ def done(call):
             bot.answer_callback_query(call.id)
             return
 
-    # Засчитываем выполнение
     with db_lock:
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) "
@@ -404,3 +396,5 @@ threading.Thread(target=scheduler, daemon=True).start()
 
 print("Бот запущен...")
 bot.infinity_polling()
+
+
