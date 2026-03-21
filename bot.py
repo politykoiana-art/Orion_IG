@@ -66,7 +66,7 @@ with db_lock:
         cursor.execute("ALTER TABLE users ADD COLUMN weekly_posts INTEGER DEFAULT 0")
         conn.commit()
 
-link_pattern = r"https://t.me/\S+"
+link_pattern = r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am|t\.me)/(?:[^\s]+)"
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 def msk_now():
