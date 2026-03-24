@@ -660,4 +660,9 @@ threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
 
 print("Бот запущен...")
+# Сбросьте вебхук и очистите очередь
+bot.delete_webhook(drop_pending_updates=True)
+time.sleep(2)  # Дайте время на очистку
+
+# Теперь запустите polling
 bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
