@@ -364,6 +364,199 @@ def done(call):
 
     bot.answer_callback_query(call.id)
 
+# ---------- Функция обработки истекших заданий для чата ----------
+def process_expired_tasks_for_chat(chat_id):
+    """Проверяет истекшие задания в указанном чате и отправляет отчёт."""
+    now = int(time.time())
+    with db_lock:
+        cursor.execute(
+            "SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?",
+            (chat_id,)
+        )
+        tasks = cursor.fetchall()
+
+    for task in tasks:
+        task_id, created, author_id, author_name, msg_id, link = task
+        if now - created <= 86400:
+            continue  # ещё не истекло
+
+        with db_lock:
+            cursor.execute(
+                "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
+                (task_id, chat_id)
+            )
+            done_users = {x[0] for x in cursor.fetchall()}
+            cursor.execute(
+                "SELECT username FROM users WHERE chat_id=?",
+                (chat_id,)
+            )
+            all_users = {x[0] for x in cursor.fetchall()}
+
+        admins = set()
+        for u in all_users:
+            with db_lock:
+                cursor.execute("SELECT id FROM users WHERE username=? AND chat_id=?", (u, chat_id))
+                row = cursor.fetchone()
+            if row and is_admin(chat_id, row[0]):
+                admins.add(u)
+
+        not_done = (all_users - done_users) - {author_name} - admins
+
+        link_msg = task_link(chat_id, msg_id) or link
+        if not_done:
+            text = "❌ Не выполнили задание"
+            if link_msg:
+                text += f" ({link_msg})"
+            text += ":\n\n" + "\n".join([f"@{u}" for u in not_done if u])
+        else:
+            text = "✅ Все выполнили задание"
+            if link_msg:
+                text += f" ({link_msg})"
+
+        try:
+            bot.send_message(chat_id, text)
+        except Exception as e:
+            print(f"Ошибка отправки отчёта: {e}")
+
+        with db_lock:
+            cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+            conn.commit()
+
+# ---------- Команды для глобальных администраторов ----------
+def is_global_admin(user_id):
+    """Проверяет, является ли пользователь глобальным администратором (из ADMIN_IDS)."""
+    admin_ids = os.environ.get("ADMIN_IDS", "")
+    if not admin_ids:
+        return False
+    admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
+    return user_id in admin_list
+
+@bot.message_handler(commands=['stats'])
+def stats_command(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "Эта команда доступна только в личных сообщениях.")
+        return
+    if not is_global_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ У вас нет прав на использование этой команды.")
+        return
+
+    with db_lock:
+        # Общее количество уникальных пользователей
+        cursor.execute("SELECT COUNT(DISTINCT id) FROM users")
+        total_users = cursor.fetchone()[0]
+
+        # Количество чатов
+        cursor.execute("SELECT COUNT(DISTINCT chat_id) FROM users")
+        total_chats = cursor.fetchone()[0]
+
+        # Активные задания (созданные за последние 24 часа)
+        now = int(time.time())
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE created > ?", (now - 86400,))
+        active_tasks = cursor.fetchone()[0]
+
+        # Выполненные задания за последние 7 дней
+        week_ago = now - 604800
+        cursor.execute("SELECT COUNT(*) FROM completions WHERE time > ?", (week_ago,))
+        weekly_completions = cursor.fetchone()[0]
+
+        # Топ-5 исполнителей за неделю
+        cursor.execute("""
+            SELECT username, COUNT(*) as cnt
+            FROM completions
+            WHERE time > ?
+            GROUP BY user_id
+            ORDER BY cnt DESC
+            LIMIT 5
+        """, (week_ago,))
+        top = cursor.fetchall()
+
+    text = (
+        f"📊 **Статистика бота**\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"💬 Активных чатов: {total_chats}\n"
+        f"📝 Активных заданий: {active_tasks}\n"
+        f"✅ Выполнено за неделю: {weekly_completions}\n\n"
+    )
+
+    if top:
+        text += "🏆 **Топ исполнителей (неделя):**\n"
+        for username, cnt in top:
+            text += f"@{username} — {cnt}\n"
+    else:
+        text += "Нет выполненных заданий за последнюю неделю."
+
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['debug_tasks'])
+def debug_tasks_command(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "Эта команда доступна только в личных сообщениях.")
+        return
+    if not is_global_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ У вас нет прав на использование этой команды.")
+        return
+
+    now = int(time.time())
+    with db_lock:
+        cursor.execute("""
+            SELECT id, chat_id, author_name, link, activity, created, message_id
+            FROM tasks
+            WHERE created > ?
+            ORDER BY created DESC
+        """, (now - 86400,))
+        tasks = cursor.fetchall()
+
+    if not tasks:
+        bot.send_message(message.chat.id, "Активных заданий нет.")
+        return
+
+    text = "📋 **Активные задания**\n\n"
+    for task in tasks:
+        task_id, chat_id, author, link, activity, created, msg_id = task
+        time_str = datetime.datetime.fromtimestamp(created, tz=MSK).strftime("%d.%m %H:%M")
+        link_msg = task_link(chat_id, msg_id) or link
+        text += (
+            f"ID: {task_id}\n"
+            f"Чат: {chat_id}\n"
+            f"Автор: @{author}\n"
+            f"Ссылка: {link_msg}\n"
+            f"Актив: {activity}\n"
+            f"Создано: {time_str}\n"
+            f"---\n"
+        )
+        if len(text) > 3800:  # защита от превышения лимита
+            bot.send_message(message.chat.id, text[:4000])
+            text = ""
+
+    if text:
+        bot.send_message(message.chat.id, text, parse_mode="Markdown", disable_web_page_preview=True)
+
+@bot.message_handler(commands=['force_report'])
+def force_report_command(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "Эта команда доступна только в личных сообщениях.")
+        return
+    if not is_global_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ У вас нет прав на использование этой команды.")
+        return
+
+    # Собираем все чаты, где есть задания или пользователи
+    with db_lock:
+        cursor.execute("SELECT DISTINCT chat_id FROM users")
+        chats = {row[0] for row in cursor.fetchall()}
+        cursor.execute("SELECT DISTINCT chat_id FROM tasks")
+        chats |= {row[0] for row in cursor.fetchall()}
+
+    if not chats:
+        bot.reply_to(message, "Нет чатов для обработки.")
+        return
+
+    bot.reply_to(message, f"🔄 Обрабатываю {len(chats)} чатов...")
+    for chat_id in chats:
+        process_expired_tasks_for_chat(chat_id)
+
+    bot.reply_to(message, "✅ Отчёты отправлены.")
+
 # ---------- Планировщик ----------
 def scheduler():
     weekly_reported = set()
@@ -411,58 +604,8 @@ def scheduler():
                     pass
                 monday_notified.add(mon_key)
 
-            # Истекшие задания (24 часа)
-            with db_lock:
-                cursor.execute(
-                    "SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?",
-                    (chat_id,)
-                )
-                tasks = cursor.fetchall()
-
-            for task in tasks:
-                task_id, created, author_id, author_name, msg_id, link = task
-                if now - created > 86400:
-                    with db_lock:
-                        cursor.execute(
-                            "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
-                            (task_id, chat_id)
-                        )
-                        done_users = {x[0] for x in cursor.fetchall()}
-                        cursor.execute(
-                            "SELECT username FROM users WHERE chat_id=?",
-                            (chat_id,)
-                        )
-                        all_users = {x[0] for x in cursor.fetchall()}
-
-                    admins = set()
-                    for u in all_users:
-                        with db_lock:
-                            cursor.execute("SELECT id FROM users WHERE username=? AND chat_id=?", (u, chat_id))
-                            row = cursor.fetchone()
-                        if row and is_admin(chat_id, row[0]):
-                            admins.add(u)
-
-                    not_done = (all_users - done_users) - {author_name} - admins
-
-                    link_msg = task_link(chat_id, msg_id) or link
-                    if not_done:
-                        text = "❌ Не выполнили задание"
-                        if link_msg:
-                            text += f" ({link_msg})"
-                        text += ":\n\n" + "\n".join([f"@{u}" for u in not_done if u])
-                    else:
-                        text = "✅ Все выполнили задание"
-                        if link_msg:
-                            text += f" ({link_msg})"
-
-                    try:
-                        bot.send_message(chat_id, text)
-                    except Exception as e:
-                        print(f"Ошибка отправки отчёта: {e}")
-
-                    with db_lock:
-                        cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-                        conn.commit()
+            # Обработка истекших заданий
+            process_expired_tasks_for_chat(chat_id)
 
             # Недельный отчёт (воскресенье 12:00)
             week_key = (chat_id, week_num)
